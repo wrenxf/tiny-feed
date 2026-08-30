@@ -82,13 +82,25 @@ handler（HTTP 参数绑定/响应） → service（业务逻辑） → repo（G
 
 ## 快速开始
 
-### 方式一：Docker Compose（推荐）
+## 方式一：Docker Compose（推荐）
 
-```bash
+一键起 MySQL + 后端 + 前端：
+
+```
 docker compose up -d --build
 ```
 
-打开 http://localhost:8081。彻底重置数据：`docker compose down -v`。
+打开 [http://localhost:8081](http://localhost:8081/) 即可。
+
+端口：
+
+- `3306` — MySQL
+- `8080` — 后端 API（直连调试用）
+- `8081` — 前端（nginx 反代到后端）
+
+要彻底重置数据：`docker compose down -v`。
+
+> `JWT_SECRET` 当前是 `please-change-me` 占位值，生产前请改成你自己的固定值。
 
 ### 方式二：本地启动
 
