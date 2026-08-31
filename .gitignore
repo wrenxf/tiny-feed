@@ -1,0 +1,30 @@
+# ===== IDE / 编辑器 =====
+.idea/
+.vscode/
+*.iml
+
+# ===== Go 构建产物 =====
+# 本地 go build 出来的可执行文件（Docker 里叫 api，本地可能是 api.exe）
+api
+api.exe
+*.test
+*.out
+
+# ===== 运行时生成物 =====
+# 上传的视频/封面目录（后端启动后自动创建 ./.run/uploads）
+# 用 **/ 是因为后端实际运行时工作目录在 apps/backend/ 下
+**/.run/
+
+# ===== 环境与密钥 =====
+.env
+*.env
+!.env.example
+
+# ===== 日志 / 临时文件 =====
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+
+#===== workbuddy产物 =====
+**/.workbuddy/
