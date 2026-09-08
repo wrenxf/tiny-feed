@@ -1,3 +1,62 @@
+// Package account 实现账号领域的数据访问层（Repository / DAO）。
+//
+// 本包是三层架构中最底层的一层，唯一职责是封装对 accounts 表的所有 SQL 操作，
+// 向上层（Service）提供与数据库无关的 Go 方法接口。
+//
+// # 分层定位
+//
+//   - 上层：account_service.go 调用本包的方法完成业务编排
+//   - 本层：只负责 CRUD + 事务，不包含任何业务规则（如密码哈希、用户名校验、token 签发）
+//   - 下层：gorm.io/gorm → database/sql → MySQL/PostgreSQL 驱动
+//
+// 依赖方向严格单向：service → repo → gorm。本包不 import gin、不 import service，
+// 保证数据层可以被任意上层复用（HTTP Handler、gRPC Server、CLI 工具、单元测试 mock）。
+//
+// # 核心类型
+//
+//   - AccountRepository: 仓储结构体，持有 *gorm.DB 连接池实例
+//   - NewAccountRepository(db): 构造函数，用于依赖注入
+//   - Account: 实体结构体（定义在 account_entity.go），映射 accounts 表
+//
+// # 方法清单
+//
+// 创建 (Create):
+//   - CreateAccount      插入新用户，GORM 自动回填自增主键 ID
+//
+// 更新 (Update):
+//   - Rename             单字段更新用户名，RowsAffected==0 时返回 ErrRecordNotFound
+//   - RenameWithToken    原子性同时更新用户名和 token（事务保证，改名后强制重登录）
+//   - ChangePassword     更新密码字段（传入值应已哈希，Repo 不负责加密）
+//   - UpdateAvatar       更新头像 URL
+//   - UpdateToken        单独更新 access token（刷新令牌场景）
+//   - UpdateFields       批量更新多个字段，接收 map[string]interface{}，用 Updates(复数)
+//   - Login              登录成功后写入 access token + refresh token
+//   - Logout             清空 token 和 refresh_token，使旧 JWT 在服务端立即失效
+//
+// 查询 (Read):
+//   - FindByID           按主键查单个用户，找不到返回 gorm.ErrRecordNotFound
+//   - FindByUsername     按用户名查（注册查重 / 登录验证）
+//   - FindAll            查所有用户（仅管理后台用，生产环境慎用，大数据量会 OOM）
+//
+// # 关键设计约定
+//
+//  1. Context 透传: 每个方法第一个参数都是 context.Context，通过 db.WithContext(ctx)
+//     传递给 GORM。当 HTTP 客户端断开或超时，GORM 会提前终止 SQL，节省 DB 资源。
+//
+//  2. 参数化查询: 所有 Where 条件都用 "field = ?", value 形式，杜绝 SQL 注入。
+//
+//  3. 错误语义: 数据库错误直接返回原始 error；"记录不存在"统一返回 gorm.ErrRecordNotFound，
+//     由 Service 层通过 apierror.ClassifyHTTPStatus 映射成 404。
+//
+//  4. 事务边界: 涉及多步写操作且要求原子性的场景（如 RenameWithToken），
+//     使用 db.Transaction(func(tx *gorm.DB) error{...})，闭包内必须用 tx 而非 ar.db，
+//     返回 non-nil error 自动 ROLLBACK，返回 nil 自动 COMMIT。
+//
+//  5. 单字段 vs 多字段更新: 单字段用 Update("col", val)；多字段用 Updates(map) 或 Updates(struct)。
+//     注意 Updates 传 struct 时会忽略零值字段，需要更新为零值时必须用 map 或 Select。
+//
+//  6. Repo 不做业务判断: 密码是否够强、用户名是否合法、token 是否过期——这些都属于 Service 层。
+//     Repo 只回答"数据库层面这次操作成功了吗"。
 package account
 
 import (
@@ -36,7 +95,7 @@ func (ar *AccountRepository) CreateAccount(ctx context.Context, account *Account
 // ========== 更新操作 (Update) ==========
 
 // Rename 仅更新用户的用户名。
-// 这是一个“单字段更新”的典型写法。
+// 这是一个"单字段更新"的典型写法。
 func (ar *AccountRepository) Rename(ctx context.Context, id uint, newUsername string) error {
 	// Model(&Account{}) 告诉 GORM 要操作哪张表（即使不传具体对象，也要传类型让 GORM 推断表名）
 	// Where("id = ?", id) 使用参数化查询，防止 SQL 注入
@@ -57,7 +116,7 @@ func (ar *AccountRepository) Rename(ctx context.Context, id uint, newUsername st
 
 // RenameWithToken 同时更新用户名和 Token，并且保证原子性。
 // 为什么需要这个方法？因为改名后通常需要强制用户重新登录（使旧 token 失效），
-// 这两个操作必须要么全成功，要么全失败，不能出现“名字改了但 token 没更新”的中间状态。
+// 这两个操作必须要么全成功，要么全失败，不能出现"名字改了但 token 没更新"的中间状态。
 func (ar *AccountRepository) RenameWithToken(ctx context.Context, id uint, newUsername string, token string) error {
 	// Transaction 开启一个数据库事务
 	return ar.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {

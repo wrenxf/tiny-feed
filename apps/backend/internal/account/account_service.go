@@ -1,3 +1,80 @@
+// Package account 实现账号领域的业务逻辑层（Service / Use Case）。
+//
+// 本包是三层架构的中间层，承载所有与账号生命周期相关的业务规则：注册、登录、改密、
+// 改名、登出、刷新令牌、个人资料更新。它向上为 Handler 提供与 HTTP 无关的 Go 方法接口，
+// 向下把数据持久化委托给 AccountRepository，自身不感知 gin、不直接拼 SQL（除一处标注的妥协外）。
+//
+// # 分层定位
+//
+//   - 上层：account_handler.go 调用本包方法完成 HTTP 请求到业务动作的映射
+//   - 本层：参数业务校验 → 密码哈希 → JWT 签发 → 编排 Repo 调用 → 返回领域结果/错误
+//   - 下层：account_repo.go 封装 GORM 操作，本包通过 *AccountRepository 依赖注入获取数据能力
+//
+// 依赖方向严格单向：handler → service → repo → gorm。本包不 import gin，保证业务逻辑
+// 可以被任意入口复用（HTTP Handler、gRPC Server、CLI 工具、定时任务、单元测试）。
+//
+// # 核心类型
+//
+//   - AccountService: 账号业务的服务端聚合根，持有 *AccountRepository 指针
+//   - NewAccountService(repo): 构造函数，repo 不能为空，由 main.go 或 wire 组装
+//
+// # 方法清单
+//
+// 注册与认证:
+//   - CreateAccount        校验非空 → bcrypt 哈希 → 写入 DB，并发撞名靠 unique 索引兜底
+//   - Login                查用户 → bcrypt 校验 → 签发双令牌 → 写回 DB → 返回 LoginResponse
+//   - ChangePassword       查用户 → 校验旧密码 → 哈希新密码 → 写回（独立认证，无需 JWT）
+//   - Logout               清空 DB 中的 token/refresh_token，使旧 JWT 在服务端立即失效
+//
+// 令牌管理:
+//   - IssueTokens          重新签发 access + refresh token 并写回 DB（滚动刷新）
+//   - ResolveRefreshToken  按 refresh token 反查账号，找不到统一返回 invalid（防枚举）
+//
+// 资料维护:
+//   - Rename               重签 JWT + 事务内同步更新 username 和 token，保证一致性
+//   - UpdateProfile        动态构建 map 做部分更新（PATCH 语义），空字段不覆盖原值
+//
+// 查询:
+//   - FindByID             按主键查，返回安全 DTO（不含 password/token）
+//   - FindByUsername       按用户名查，返回最小字段集
+//
+// 辅助:
+//   - isDuplicateKeyError  判断唯一键冲突（兼容 gorm.ErrDuplicatedKey + MySQL 1062 字符串兜底）
+//
+// # 关键设计约定
+//
+//  1. 密码安全: 明文密码绝不入库、绝不出 Service 层。存储用 bcrypt.GenerateFromPassword
+//     (DefaultCost=10, 2^10 次迭代)，校验用 bcrypt.CompareHashAndPassword（耗时固定，防时序攻击）。
+//
+//  2. 防枚举攻击: Login 对"用户不存在"和"密码错误"返回完全相同的错误消息
+//     ("invalid username or password")；ResolveRefreshToken 对所有失败统一返回 "invalid refresh token"。
+//     绝不向调用方泄露账号是否存在、token 是过期还是已被使用等细节。
+//
+//  3. 并发安全: 注册和改名不做"先查后插/先查后改"，而是直接写入，依赖数据库 unique 索引
+//     拒绝重复，再用 isDuplicateKeyError 把底层 500 转成业务可读的 "username already taken"。
+//     这避免了 TOCTOU (Time-of-Check-to-Time-of-Use) 竞态条件。
+//
+//  4. 事务一致性: 涉及多步写操作且要求原子性的场景（如 Rename 同时改 username 和 token），
+//     调用 repo 的事务方法（RenameWithToken），保证不会出现"新名字但旧 token"的中间态。
+//
+//  5. Context 透传: 所有方法第一个参数都是 context.Context，一路传递到 Repo/GORM，
+//     支持客户端断连取消、超时控制、链路追踪。绝不使用 context.Background()。
+//
+//  6. 最小暴露原则: 查询方法返回专用 DTO（FindByIDResponse / FindByUsernameResponse / LoginResponse），
+//     手动映射字段，永远不把包含 Password、Token 的完整 Account 实体直接返回给上层。
+//
+//  7. 部分更新语义: UpdateProfile 动态构建 map[string]interface{}，只把请求中非空的字段放入 map，
+//     避免空字符串覆盖原有数据；map 为空时直接返回 nil，节省一次 DB IO。
+//
+//  8. 单点登出机制: 每次 Login/IssueTokens 都把新令牌写回 DB 覆盖旧值，配合 JWT 中间件的
+//     TokenChecker（比对请求中的 token 与 DB 中存储的是否一致），实现服务端主动注销能力，
+//     弥补了无状态 JWT 无法主动失效的天然缺陷。
+//
+// # 已知架构妥协
+//
+// ResolveRefreshToken 内部直接访问了 s.repo.db 穿透了 Repo 层抽象。这是一个为了省事
+// 没在 repo 里补 FindByRefreshToken 方法的临时方案。在生产级大型项目中，应在 Repo 层
+// 补齐该方法，保持 Service 层对数据访问细节的完全无感知。
 package account
 
 // 账号服务层：负责账号生命周期相关的业务逻辑，包括注册、登录、改密、

@@ -1,3 +1,67 @@
+// Package account 实现账号领域的 HTTP 处理器层（Handler / Controller）。
+//
+// 本包是三层架构中最上层的一层，唯一职责是在 HTTP 协议与业务逻辑之间做"翻译"：
+// 把 gin.Context 里的原始请求转换成 Service 层的方法调用，再把 Service 的返回值
+// 或错误转换回统一格式的 JSON 响应。
+//
+// # 分层定位
+//
+//   - 上层：http_router.go 把本包的 Handler 方法注册到 Gin 路由表
+//   - 本层：参数绑定 → 身份提取 → 调用 Service → 序列化响应
+//   - 下层：account_service.go 实现真正的业务规则（密码哈希、token 签发、唯一性校验）
+//
+// 依赖方向严格单向：router → handler → service → repo。本包不 import gorm、不 import repo，
+// 保证 Handler 层可以被独立单元测试（注入 mock Service 即可，无需启动数据库）。
+//
+// # 核心类型
+//
+//   - AccountHandler: 处理器结构体，持有 *AccountService 指针（依赖注入）
+//   - NewAccountHandler(service): 构造函数，在应用启动时由 main.go 或 wire 组装
+//
+// # 方法清单（每个方法对应 router 中注册的一条路由）
+//
+// 公开接口（无需 JWT）:
+//   - CreateAccount    POST /account/register       注册新用户
+//   - Login            POST /account/login          登录，返回 access + refresh token
+//   - ChangePassword   POST /account/changePassword 通过旧密码改密（独立认证方式）
+//   - FindByID         POST /account/findByID       按 ID 查用户（内部/管理用）
+//   - FindByUsername   POST /account/findByUsername 按用户名查用户
+//   - Refresh          POST /account/refresh        用 X-Refresh-Token 头刷新令牌对
+//
+// 受保护接口（需 JWT 中间件）:
+//   - Logout           POST /account/logout         清空 DB 中的 token，使旧 JWT 失效
+//   - Rename           POST /account/rename         改名并重签 token
+//   - UpdateProfile    POST /account/updateProfile  部分更新头像/bio
+//
+// # 统一处理模板
+//
+// 几乎每个 Handler 方法都遵循同一个四步模板：
+//
+//  1. apierror.BindJSON(c, &req)        绑定并校验请求体，失败自动写 400 响应
+//  2. jwtmw.GetAccountID(c)             （仅受保护接口）从 context 提取当前用户 ID
+//  3. h.service.XXX(c.Request.Context(), ...)  调用 Service，透传 Context 支持取消
+//  4. c.JSON(status, gin.H{...})        成功返回数据，失败用 ClassifyHTTPStatus 映射状态码
+//
+// # 关键设计约定
+//
+//  1. 职责边界: Handler 只做格式校验（字段非空、类型匹配），不做业务校验
+//     （密码强度、用户名唯一性、token 是否过期）。后者属于 Service 层。
+//
+//  2. 身份来源: 受保护接口的 accountID 必须从 jwtmw.GetAccountID(c) 获取，
+//     绝不能从请求体读取。这是防止水平越权（用户篡改 body 中的 ID 操作他人账号）的安全红线。
+//
+//  3. Context 透传: 所有 Service 调用都传 c.Request.Context()，而非 context.Background()。
+//     当客户端断开或超时，Context 取消会一路传递到 GORM，提前终止 SQL 节省 DB 资源。
+//
+//  4. 错误分类: 通用错误用 apierror.ClassifyHTTPStatus(err) 自动映射 400/404/409/500；
+//     登录/刷新等敏感接口固定返回 401 + 模糊提示，避免泄露"用户名是否存在"等细节（防枚举攻击）。
+//
+//  5. 最小暴露: 成功响应只返回前端需要的字段（如 id, username），
+//     绝不暴露 password hash、created_at、内部 token 等敏感或冗余信息。
+//
+//  6. 双令牌机制: access token 短期有效（~15min），放 Authorization: Bearer 头；
+//     refresh token 长期有效（~7d），放自定义 X-Refresh-Token 头。Refresh 接口会轮换两者，
+//     旧 refresh token 随即失效，实现滑动过期 + 可撤销的安全策略。
 package account
 
 // =============================================================================
